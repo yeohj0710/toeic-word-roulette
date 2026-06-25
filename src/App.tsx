@@ -1,4 +1,5 @@
 import {
+  ClipboardPaste,
   Eye,
   EyeOff,
   Pause,
@@ -37,6 +38,20 @@ type Draft = {
   enabled: boolean
 }
 
+type BulkImportDraft = {
+  text: string
+  category: WordCategory
+  day: string
+  level: '800' | '900'
+  weight: string
+  enabled: boolean
+}
+
+type ParsedImportWord = {
+  term: string
+  meaning: string
+}
+
 const STORAGE_KEY = 'toeic-word-roulette-state-v2'
 const DEFAULT_DURATION = 60
 const SLOT_ITEM_HEIGHT = 92
@@ -44,6 +59,17 @@ const SLOT_CENTER_INDEX = 2
 const SPIN_MS = 2200
 const SPIN_LEAD_COUNT = 32
 const TIMER_OPTIONS = [30, 45, 60, 90]
+const QUOTE_PAIRS: Record<string, string> = {
+  '"': '"',
+  "'": "'",
+  '“': '”',
+  '‘': '’',
+}
+
+const BULK_PLACEHOLDER = `"alleviate" "완화하다"
+"consecutive" "연속적인"
+allocate - 할당하다
+in advance	미리`
 
 const emptyState: SavedState = {
   overrides: {},
@@ -82,6 +108,135 @@ function toDraft(word: RouletteWord | null): Draft {
     weight: String(word?.weight ?? 1),
     enabled: word?.enabled ?? true,
   }
+}
+
+function sanitizeImportValue(value: string) {
+  return value
+    .replace(/^[\s,;:|]+|[\s,;:|]+$/g, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+}
+
+function extractQuotedSegments(text: string) {
+  const segments: string[] = []
+  let index = 0
+
+  while (index < text.length) {
+    const open = text[index]
+    const close = QUOTE_PAIRS[open]
+
+    if (!close) {
+      index += 1
+      continue
+    }
+
+    let cursor = index + 1
+    let value = ''
+
+    while (cursor < text.length) {
+      const character = text[cursor]
+      if (character === '\\' && cursor + 1 < text.length) {
+        value += text[cursor + 1]
+        cursor += 2
+        continue
+      }
+
+      if (character === close) {
+        break
+      }
+
+      value += character
+      cursor += 1
+    }
+
+    if (cursor < text.length) {
+      const normalized = sanitizeImportValue(value)
+      if (normalized) {
+        segments.push(normalized)
+      }
+      index = cursor + 1
+    } else {
+      index += 1
+    }
+  }
+
+  return segments
+}
+
+function removeQuotedSegments(text: string) {
+  let result = ''
+  let index = 0
+
+  while (index < text.length) {
+    const open = text[index]
+    const close = QUOTE_PAIRS[open]
+
+    if (!close) {
+      result += open
+      index += 1
+      continue
+    }
+
+    let cursor = index + 1
+    while (cursor < text.length) {
+      if (text[cursor] === '\\' && cursor + 1 < text.length) {
+        cursor += 2
+        continue
+      }
+
+      if (text[cursor] === close) {
+        break
+      }
+
+      cursor += 1
+    }
+
+    result += ' '
+    index = cursor < text.length ? cursor + 1 : index + 1
+  }
+
+  return result
+}
+
+function parseLineImport(text: string) {
+  return text
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .map((line) => {
+      const parts = line
+        .split(/\s*(?:\t|=>|->|:| - | – | — )\s*/)
+        .map(sanitizeImportValue)
+        .filter(Boolean)
+
+      if (parts.length >= 2) {
+        return { term: parts[0], meaning: parts.slice(1).join(' ') }
+      }
+
+      return { term: sanitizeImportValue(line), meaning: '' }
+    })
+    .filter((item) => /[A-Za-z0-9가-힣]/.test(item.term))
+}
+
+function parseBulkImport(text: string): ParsedImportWord[] {
+  const quotedSegments = extractQuotedSegments(text)
+
+  if (quotedSegments.length > 0) {
+    const quotedPairs: ParsedImportWord[] = []
+    for (let index = 0; index < quotedSegments.length; index += 2) {
+      quotedPairs.push({
+        term: quotedSegments[index],
+        meaning: quotedSegments[index + 1] ?? '',
+      })
+    }
+
+    return [
+      ...quotedPairs,
+      ...parseLineImport(removeQuotedSegments(text)),
+    ].filter((item) => /[A-Za-z0-9가-힣]/.test(item.term))
+  }
+
+  return parseLineImport(text)
 }
 
 function formatTime(seconds: number) {
@@ -174,6 +329,35 @@ function makeCustomWord(): RouletteWord {
   }
 }
 
+function makeImportedWord(
+  item: ParsedImportWord,
+  draft: BulkImportDraft,
+  index: number,
+): RouletteWord {
+  const id =
+    globalThis.crypto?.randomUUID?.() ??
+    `${Date.now()}-${index}-${Math.random()}`
+  const day = draft.category === 'day' ? Number(draft.day) : null
+  const level = draft.category === 'day' ? draft.level : null
+  const source =
+    draft.category === 'day'
+      ? `day${String(day).padStart(2, '0')} ${draft.level}`
+      : `bulk-${draft.category}`
+
+  return {
+    id: `custom-bulk-${id}`,
+    term: item.term,
+    meaning: item.meaning || '뜻을 입력하세요',
+    source,
+    category: draft.category,
+    day,
+    level,
+    weight: normalizeWeight(draft.weight),
+    enabled: draft.enabled,
+    custom: true,
+  }
+}
+
 function makeIdleReel(pool: RouletteWord[], current: RouletteWord | null) {
   const fallback = current ?? pool[0]
   if (!fallback) {
@@ -227,6 +411,14 @@ function App() {
   const [editQuery, setEditQuery] = useState('')
   const [selectedEditId, setSelectedEditId] = useState(TOEIC_WORDS[0]?.id ?? '')
   const [draft, setDraft] = useState<Draft>(() => toDraft(null))
+  const [bulkDraft, setBulkDraft] = useState<BulkImportDraft>({
+    text: '',
+    category: 'note',
+    day: '1',
+    level: '800',
+    weight: '1',
+    enabled: true,
+  })
   const [currentId, setCurrentId] = useState(() => TOEIC_WORDS[0]?.id ?? '')
   const spinTimeoutRef = useRef<number | null>(null)
   const durationRef = useRef(duration)
@@ -307,6 +499,11 @@ function App() {
 
     return pool.slice(0, 18)
   }, [editQuery, words])
+
+  const parsedBulkWords = useMemo(
+    () => parseBulkImport(bulkDraft.text),
+    [bulkDraft.text],
+  )
 
   const historyWords = historyIds
     .map((id) => words.find((word) => word.id === id))
@@ -409,6 +606,25 @@ function App() {
     }))
     setSelectedEditId(word.id)
     setDraft(toDraft(word))
+  }
+
+  const importBulkWords = () => {
+    if (parsedBulkWords.length === 0) {
+      return
+    }
+
+    const importedWords = parsedBulkWords.map((item, index) =>
+      makeImportedWord(item, bulkDraft, index),
+    )
+
+    setSavedState((state) => ({
+      ...state,
+      customWords: [...importedWords, ...state.customWords],
+    }))
+    setSelectedEditId(importedWords[0].id)
+    setDraft(toDraft(importedWords[0]))
+    setEditQuery(importedWords[0].term)
+    setBulkDraft((value) => ({ ...value, text: '' }))
   }
 
   useEffect(() => {
@@ -679,6 +895,144 @@ function App() {
             </button>
           ))}
         </div>
+
+        <section className="bulk-import">
+          <div className="bulk-header">
+            <div>
+              <p>Paste</p>
+              <h3>붙여넣기 가져오기</h3>
+            </div>
+            <span>{parsedBulkWords.length}개 감지</span>
+          </div>
+
+          <label>
+            <span>복사한 내용</span>
+            <textarea
+              value={bulkDraft.text}
+              onChange={(event) =>
+                setBulkDraft((value) => ({ ...value, text: event.target.value }))
+              }
+              placeholder={BULK_PLACEHOLDER}
+            />
+          </label>
+
+          <div className="bulk-options">
+            <label>
+              <span>분류</span>
+              <select
+                value={bulkDraft.category}
+                onChange={(event) =>
+                  setBulkDraft((value) => ({
+                    ...value,
+                    category: event.target.value as WordCategory,
+                  }))
+                }
+              >
+                {(['day', 'idiom', 'note', 'conjunctive'] as const).map((item) => (
+                  <option key={item} value={item}>
+                    {categoryLabel(item)}
+                  </option>
+                ))}
+              </select>
+            </label>
+
+            <label>
+              <span>가중치</span>
+              <input
+                type="number"
+                min="0"
+                max="20"
+                step="0.5"
+                value={bulkDraft.weight}
+                onChange={(event) =>
+                  setBulkDraft((value) => ({
+                    ...value,
+                    weight: event.target.value,
+                  }))
+                }
+              />
+            </label>
+
+            {bulkDraft.category === 'day' ? (
+              <>
+                <label>
+                  <span>Day</span>
+                  <select
+                    value={bulkDraft.day}
+                    onChange={(event) =>
+                      setBulkDraft((value) => ({
+                        ...value,
+                        day: event.target.value,
+                      }))
+                    }
+                  >
+                    {Array.from({ length: 30 }, (_, index) => index + 1).map(
+                      (item) => (
+                        <option key={item} value={item}>
+                          Day {String(item).padStart(2, '0')}
+                        </option>
+                      ),
+                    )}
+                  </select>
+                </label>
+
+                <label>
+                  <span>레벨</span>
+                  <select
+                    value={bulkDraft.level}
+                    onChange={(event) =>
+                      setBulkDraft((value) => ({
+                        ...value,
+                        level: event.target.value as '800' | '900',
+                      }))
+                    }
+                  >
+                    <option value="800">800</option>
+                    <option value="900">900</option>
+                  </select>
+                </label>
+              </>
+            ) : null}
+          </div>
+
+          {parsedBulkWords.length > 0 ? (
+            <div className="import-preview">
+              {parsedBulkWords.slice(0, 4).map((word, index) => (
+                <span key={`${word.term}-${index}`}>
+                  {word.term}
+                  {word.meaning ? ` · ${word.meaning}` : ''}
+                </span>
+              ))}
+              {parsedBulkWords.length > 4 ? (
+                <small>외 {parsedBulkWords.length - 4}개</small>
+              ) : null}
+            </div>
+          ) : null}
+
+          <label className="check-row">
+            <input
+              type="checkbox"
+              checked={bulkDraft.enabled}
+              onChange={(event) =>
+                setBulkDraft((value) => ({
+                  ...value,
+                  enabled: event.target.checked,
+                }))
+              }
+            />
+            <span>바로 룰렛에 포함</span>
+          </label>
+
+          <button
+            type="button"
+            className="primary-action"
+            onClick={importBulkWords}
+            disabled={parsedBulkWords.length === 0}
+          >
+            <ClipboardPaste size={18} />
+            감지한 단어 추가
+          </button>
+        </section>
 
         <label className="search-field">
           <span>검색</span>
